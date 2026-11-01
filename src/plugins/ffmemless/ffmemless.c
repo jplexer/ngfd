@@ -111,6 +111,10 @@ int ffmemless_evdev_file_search(unsigned long features[4])
 		}
 		result = test_bit(FF_RUMBLE, features);
 		result = result || test_bit(FF_CONSTANT, features);
+		/* Some drivers (e.g. Cirrus Logic CS40L26) only play waveforms
+		 * from the chip's wavetable: FF_PERIODIC with FF_CUSTOM, no
+		 * rumble or constant effects at all. */
+		result = result || test_bit(FF_CUSTOM, features);
 		result = result && test_bit(FF_PERIODIC, features);
 		if (result)
 			return fp;

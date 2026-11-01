@@ -64,6 +64,10 @@ struct ffm_effect_data {
 	guint playback_time;
 	int poll_id;
 	int16_t customEffectId;
+	/* Custom data layout {bank, index} instead of {index, sec, msec},
+	 * used when <effect>_CUSTOM_BANK is given (e.g. Cirrus CS40L26). */
+	gboolean customBanked;
+	int16_t customBank;
 	struct ff_effect cached_effect;
 };
 
@@ -238,11 +242,26 @@ ffm_effect_list_done:
 	return list;
 }
 
+/* Fill custom waveform data for upload, returns the number of entries used */
+static int ffm_fill_custom_data(const struct ffm_effect_data *data,
+				int16_t custom_data[CUSTOM_DATA_LEN])
+{
+	if (data->customBanked) {
+		custom_data[0] = data->customBank;
+		custom_data[1] = data->customEffectId;
+		custom_data[2] = 0;
+		return 2;
+	}
+	custom_data[0] = data->customEffectId;
+	return CUSTOM_DATA_LEN;
+}
+
 /* Load the default fall-back effect and insert it to effects table */
 static int ffm_setup_default_effect(GHashTable *effects, int dev_fd)
 {
 	struct ff_effect ff;
 	struct ffm_effect_data *data;
+	int16_t default_custom_data[CUSTOM_DATA_LEN] = {0, 0, 0};
 
 	memset(&ff, 0, sizeof(struct ff_effect));
 	data = (struct ffm_effect_data *)g_hash_table_lookup(effects,
@@ -269,6 +288,29 @@ static int ffm_setup_default_effect(GHashTable *effects, int dev_fd)
 		ff.type = FF_CONSTANT;
 		ff.replay.length = NGF_DEFAULT_DURATION;
 		ff.u.constant.level = NGF_DEFAULT_LEVEL;
+	} else if (!ffmemless_has_feature(FF_RUMBLE, ffm.features) &&
+		   ffmemless_has_feature(FF_CUSTOM, ffm.features)) {
+		/* Wavetable-only device: play a waveform from the chip's
+		 * wavetable, configurable with default_custom_bank and
+		 * default_custom_index in the plugin settings. */
+		const NProplist *p = ffm.sys_props &&
+			n_proplist_has_key(ffm.sys_props, "default_custom_index")
+			? ffm.sys_props : ffm.ngfd_props;
+		const char *bank = n_proplist_get_string(p,
+						"default_custom_bank");
+		const char *index = n_proplist_get_string(p,
+						"default_custom_index");
+		N_DEBUG (LOG_CAT "Using custom waveform default effect");
+		data->customBanked = bank != NULL;
+		data->customBank = bank ? atoi(bank) : 0;
+		data->customEffectId = index ? atoi(index) : 0;
+		ff.type = FF_PERIODIC;
+		ff.replay.length = NGF_DEFAULT_DURATION;
+		ff.u.periodic.waveform = FF_CUSTOM;
+		ff.u.periodic.magnitude = NGF_DEFAULT_PMAGNITUDE;
+		ff.u.periodic.custom_data = default_custom_data;
+		ff.u.periodic.custom_len = ffm_fill_custom_data(data,
+						default_custom_data);
 	} else {
 		N_DEBUG (LOG_CAT "Using rumble default effect");
 		ff.type = FF_RUMBLE;
@@ -276,14 +318,19 @@ static int ffm_setup_default_effect(GHashTable *effects, int dev_fd)
 		ff.u.rumble.strong_magnitude = NGF_DEFAULT_RMAGNITUDE;
 		ff.u.rumble.weak_magnitude = NGF_DEFAULT_RMAGNITUDE;
 	}
-	if (ffm.cache_effects) {
-		memcpy(&data->cached_effect, &ff, sizeof(ff));
-	}
 	if (ffmemless_upload_effect(&ff, dev_fd)) {
 		N_DEBUG (LOG_CAT "%s effect load failed", N_HAPTIC_EFFECT_DEFAULT);
 		return -1;
 	}
 	data->id = ff.id;
+	if (ff.type == FF_PERIODIC) {
+		/* custom data points to the stack, needed only for upload */
+		ff.u.periodic.custom_data = NULL;
+		ff.u.periodic.custom_len = 0;
+	}
+	if (ffm.cache_effects) {
+		memcpy(&data->cached_effect, &ff, sizeof(ff));
+	}
 
 	N_DEBUG (LOG_CAT "Added effect %s, id %d", N_HAPTIC_EFFECT_DEFAULT, ff.id);
 	return 0;
@@ -434,9 +481,13 @@ static int ffm_setup_effects(const NProplist *props, GHashTable *effects)
 			if (ff.u.periodic.waveform == FF_CUSTOM) {
 				data->customEffectId = ffm_get_int_value(props,
 					key, "_CUSTOM", 0, UINT16_MAX);
-				custom_data[0] = data->customEffectId;
+				data->customBanked = ffm_get_str_value(props,
+					key, "_CUSTOM_BANK") != NULL;
+				data->customBank = ffm_get_int_value(props,
+					key, "_CUSTOM_BANK", 0, INT16_MAX);
 				ff.u.periodic.custom_data = custom_data;
-				ff.u.periodic.custom_len = CUSTOM_DATA_LEN;
+				ff.u.periodic.custom_len =
+					ffm_fill_custom_data(data, custom_data);
 				custom_data_applied = TRUE;
 			}
 
@@ -489,7 +540,8 @@ static int ffm_setup_effects(const NProplist *props, GHashTable *effects)
 		/* If the id was -1, kernel has updated it with valid value */
 		data->id = ff.id;
 		/* Calculate the playback time */
-		if (ff.type == FF_PERIODIC && ff.u.periodic.waveform == FF_CUSTOM) {
+		if (ff.type == FF_PERIODIC && ff.u.periodic.waveform == FF_CUSTOM
+		    && !data->customBanked) {
 			data->playback_time = ff.u.periodic.custom_data[1] * 1000
 				+ ff.u.periodic.custom_data[2];
 			N_DEBUG(LOG_CAT "Custom effect %d reports back %hd ms playback time",
@@ -590,10 +642,10 @@ static int ffm_play(struct ffm_effect_data *data, int play)
 		if (play) {
 			data->cached_effect.id = -1;
 			if (data->cached_effect.type == FF_PERIODIC) {
-				custom_data[0] = data->customEffectId;
 				custom_data_applied = TRUE;
 				data->cached_effect.u.periodic.custom_data = custom_data;
-				data->cached_effect.u.periodic.custom_len = CUSTOM_DATA_LEN;
+				data->cached_effect.u.periodic.custom_len =
+					ffm_fill_custom_data(data, custom_data);
 			}
 			if (ffmemless_upload_effect(&data->cached_effect, ffm.dev_file)) {
 				if (custom_data_applied) {
