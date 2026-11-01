@@ -530,6 +530,19 @@ static int ffm_setup_effects(const NProplist *props, GHashTable *effects)
 			continue;
 		}
 
+		/* Wavetable-only devices play nothing but custom waveforms.
+		 * Skip the generic effects (rumble, constant, sine...), so
+		 * that the device specific settings file can define those
+		 * effects instead of failing the whole sink. */
+		if (!ffmemless_has_feature(FF_RUMBLE, ffm.features) &&
+		    !ffmemless_has_feature(FF_CONSTANT, ffm.features) &&
+		    !(ff.type == FF_PERIODIC &&
+		      ff.u.periodic.waveform == FF_CUSTOM)) {
+			N_DEBUG (LOG_CAT "%s: wavetable-only device, skipping "
+						"non-custom effect", key);
+			continue;
+		}
+
 		/* Finally load the effect */
 		if (ffmemless_upload_effect(&ff, ffm.dev_file)) {
 			N_DEBUG (LOG_CAT "%s effect loading failed",
