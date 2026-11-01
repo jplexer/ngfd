@@ -420,6 +420,10 @@ static int ffm_setup_effects(const NProplist *props, GHashTable *effects)
 		value = ffm_get_str_value(props, key, "_DIRECTION");
 		if (!g_strcmp0(value, "reverse"))
 			ff.direction = FF_DIR_REVERSE;
+		else if (!g_strcmp0(value, "none"))
+			/* Some drivers (e.g. Cirrus CS40L26) only accept 0x0000
+			 * and 0x8000 (inverted) and refuse to play otherwise. */
+			ff.direction = 0;
 		else
 			ff.direction = FF_DIR_FORWARD;
 
