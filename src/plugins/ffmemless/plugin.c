@@ -68,6 +68,12 @@ struct ffm_effect_data {
 	 * used when <effect>_CUSTOM_BANK is given (e.g. Cirrus CS40L26). */
 	gboolean customBanked;
 	int16_t customBank;
+	/* Software repeat for banked effects: the CS40L26 plays a stored
+	 * waveform once per trigger and ignores both the repeat count and
+	 * replay.delay, so ngfd re-triggers it every repeat_period ms. */
+	guint repeat_period;
+	guint repeat_id;
+	int repeats_left;
 	struct ff_effect cached_effect;
 };
 
@@ -547,6 +553,11 @@ static int ffm_setup_effects(const NProplist *props, GHashTable *effects)
 			continue;
 		}
 
+		if (data->customBanked) {
+			data->repeat_period = ff.replay.length + ff.replay.delay;
+			ff.replay.delay = 0;
+		}
+
 		/* Finally load the effect */
 		if (ffmemless_upload_effect(&ff, ffm.dev_file)) {
 			N_DEBUG (LOG_CAT "%s effect loading failed",
@@ -633,9 +644,44 @@ gboolean ffm_playback_done(gpointer userdata)
 	return FALSE;
 }
 
+static int ffm_play(struct ffm_effect_data *data, int play);
+
+static gboolean ffm_repeat_cb(gpointer userdata)
+{
+	struct ffm_effect_data *data = (struct ffm_effect_data *) userdata;
+	int id = ffm.cache_effects ? data->cached_effect.id : data->id;
+
+	if (data->repeats_left <= 0) {
+		data->repeat_id = 0;
+		return FALSE;
+	}
+	if (data->repeats_left != INT32_MAX)
+		data->repeats_left--;
+
+	if (ffmemless_play(id, ffm.dev_file, 1)) {
+		N_DEBUG (LOG_CAT "re-trigger of %d failed", id);
+		data->repeat_id = 0;
+		return FALSE;
+	}
+	return TRUE;
+}
+
 static int ffm_play(struct ffm_effect_data *data, int play)
 {
 	data->poll_id = 0;
+
+	if (data->repeat_id) {
+		g_source_remove(data->repeat_id);
+		data->repeat_id = 0;
+	}
+
+	if (play > 1 && data->customBanked && data->repeat_period) {
+		data->repeats_left = (play == INT32_MAX) ? INT32_MAX : play - 1;
+		data->repeat_id = g_timeout_add(data->repeat_period,
+						ffm_repeat_cb, data);
+		N_DEBUG (LOG_CAT "software repeat every %u ms", data->repeat_period);
+		play = 1;
+	}
 
 	/* if there is playback time set, this is single shot effect */
 	if (play) {
@@ -782,7 +828,11 @@ static int ffm_sink_prepare(NSinkInterface *iface, NRequest *request)
 		 * keep repeating them until timer runs out and effect ends.
 		 */
 		copy->repeat = INT32_MAX; /* repeat to "infinity" */
-		if (!copy->playback_time && playback_time) {
+		if (copy->customBanked)
+			/* Software-repeated: keep going until stopped, or
+			 * until haptic.duration if one was given. */
+			copy->playback_time = playback_time;
+		else if (!copy->playback_time && playback_time) {
 			copy->playback_time = playback_time;
 		};
 	}
